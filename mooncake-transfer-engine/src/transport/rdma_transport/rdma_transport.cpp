@@ -13,7 +13,16 @@
 // limitations under the License.
 
 #include "transport/rdma_transport/rdma_transport.h"
-
+#if defined(USE_SUNRISE)
+#include "pccl.h"  /* 包含 pcclGetErrorString 声明 */
+#include "tang_rt/driver_types.h"
+#include "pccl_core.h"
+#include "pccl_net.h"
+// #include "pccl_ibvwrap.h"
+#include "pccl_debug.h"
+#include "pcclNetTestGdr.h"
+#include "pccl_socket.h"
+#endif
 #include <glog/logging.h>
 #include <sys/mman.h>
 #include <sys/time.h>
@@ -178,7 +187,14 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     return registerLocalMemoryInternal(addr, length, name, remote_accessible,
                                        update_metadata, false);
 }
-
+void testSunriseGdr() {
+    test_options_t opts = {.verbose = false, .test_num = -1, .run_all = false,
+        .device_id = -1, .gpu_id = -1, .buffer_size = 2097152, .iterations = 1000,
+        .server_mode = false, .remote_ip = 0x0, .port = 0};
+    test_result_t result {};
+    result = test_30_gdr_capability_query(&opts);
+    LOG(INFO) << "test_30_gdr_capability_query returns 0x" << result << ".";
+}
 int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                                const std::string &name,
                                                bool remote_accessible,
@@ -189,7 +205,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
                                   IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ;
-
+#if defined(USE_SUNRISE)
+    // testSunriseGdr();
+#endif()
     static int access_rights = kBaseAccessRights;
     if (MCIbRelaxedOrderingEnabled) {
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
@@ -294,9 +312,6 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = length;
-#ifdef ENABLE_MULTI_PROTOCOL
-    buffer_desc.protocol = "rdma";
-#endif
     int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (rc) return rc;
     return 0;
@@ -358,15 +373,10 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
-    auto desc = metadata_->getSegmentDesc(local_server_name_);
-    if (!desc) desc = std::make_shared<SegmentDesc>();
+    auto desc = std::make_shared<SegmentDesc>();
+    if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-#ifdef ENABLE_MULTI_PROTOCOL
-    if (!desc->protocol.empty()) desc->protocol += ",";
-    desc->protocol += "rdma";
-#else
     desc->protocol = "rdma";
-#endif
     for (auto &entry : context_list_) {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = entry->deviceName();
@@ -379,6 +389,26 @@ int RdmaTransport::allocateLocalSegmentID() {
                                std::move(desc));
     return 0;
 }
+// typedef enum {
+//     TEST_PASS = 0,
+//     TEST_FAIL = 1,
+//     TEST_SKIP = 2
+// } test_result_t;
+// /* 测试选项 */
+// typedef struct {
+//     bool verbose;           /* 详细输出 */
+//     int test_num;           /* 运行特定测试编号 */
+//     bool run_all;           /* 运行所有测试 */
+//     int device_id;          /* 指定设备ID */
+//     int gpu_id;             /* 指定GPU ID */
+//     size_t buffer_size;     /* 缓冲区大小 */
+//     int iterations;         /* 迭代次数（用于性能测试） */
+//     bool server_mode;       /* 服务端模式 */
+//     char *remote_ip;        /* 对端IP地址（客户端模式需要） */
+//     int port;               /* 端口号（默认0，系统自动分配） */
+// } test_options_t;
+
+//test_result_t test_30_gdr_capability_query(test_options_t *opts);
 
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
@@ -392,6 +422,7 @@ int RdmaTransport::registerLocalMemoryBatch(
                          << buffer.addr << " length " << buffer.length;
         }
     }
+
 #else
     std::vector<std::future<int>> results;
     for (auto &buffer : buffer_list) {
@@ -642,7 +673,9 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     }
     if (!context) return ERR_INVALID_ARGUMENT;
 
-    // Use existing endpoint or create new one.
+#ifdef CONFIG_ERDMA
+    if (context->deleteEndpoint(peer_desc.local_nic_path)) return ERR_ENDPOINT;
+#endif
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) return ERR_ENDPOINT;
     return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
@@ -697,18 +730,10 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
             continue;
         }
 
-        // Resolve NUMA-aware location for segmented buffers
-        std::string location = buffer.name;
-        SegmentsLocationInfo seg_info;
-        if (parseSegmentsLocation(buffer.name, seg_info)) {
-            location = resolveSegmentsLocation(seg_info, buffer.length,
-                                               offset - buffer.addr);
-        }
-
         device_id =
             hint.empty()
-                ? desc->topology.selectDevice(location, retry_count)
-                : desc->topology.selectDevice(location, hint, retry_count);
+                ? desc->topology.selectDevice(buffer.name, retry_count)
+                : desc->topology.selectDevice(buffer.name, hint, retry_count);
         if (device_id >= 0) return 0;
         device_id = hint.empty() ? desc->topology.selectDevice(
                                        kWildcardLocation, retry_count)

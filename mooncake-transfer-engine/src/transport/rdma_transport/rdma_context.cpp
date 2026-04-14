@@ -217,7 +217,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
-#if defined(USE_MLU) || (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
+#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
     // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
@@ -257,6 +257,10 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
                                       (uintptr_t)addr, dmabuf_fd, access);
     }
+#elif defined(USE_SUNRISE)
+    mrMeta.addr = addr;
+    mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    LOG(INFO) << "【sunrise】ibv_reg_mr success, sunrise gpu memory addr=" << addr;
 #else
     mrMeta.addr = addr;
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
@@ -288,10 +292,11 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
              iter != memory_region_list_.end(); ++iter) {
             if (iter->addr <= addr &&
                 addr < (char *)(iter->addr) + iter->mr->length) {
-                if (ibv_dereg_mr(iter->mr)) {
+                if (ibv_dereg_mr(iter->mr)) { // check sunrise memory can be dereg?
                     LOG(ERROR) << "Failed to unregister memory " << addr;
                     return ERR_CONTEXT;
                 }
+                LOG(INFO) << "【sunrise】ibv_dereg_mr success, addr=" << iter->addr;
                 memory_region_list_.erase(iter);
                 has_removed = true;
                 break;
@@ -442,64 +447,34 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
     gid_index = -1;
     int i;
     struct ibv_gid_entry gid_entry;
-    int fallback_ipv4_gid_without_network = -1;
-    int fallback_ipv6_gid_with_network = -1;
-    int fallback_ipv6_gid_without_network = -1;
+    bool fallback_found = false;
     GidNetworkState state = GidNetworkState::GID_NOT_FOUND;
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
-            // Reached end of valid GID indices
-            break;
+            PLOG(ERROR) << "Failed to query GID " << i << " on " << device_name
+                        << "/" << port;
+            continue;  // if gid is invalid ibv_query_gid_ex() will return !0
         }
 
-        if (gid_entry.gid_type != IBV_GID_TYPE_ROCE_V2 &&
-            gid_entry.gid_type != IBV_GID_TYPE_IB) {
-            continue;
-        }
-
-        const bool is_ipv4_gid =
-            gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2 &&
-            ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw);
-        const bool has_network_device = hasNetworkDevice(device_name, port, i);
-
-        if (is_ipv4_gid) {
-            if (has_network_device) {
+        if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
+             gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
+            gid_entry.gid_type == IBV_GID_TYPE_IB) {
+            // Check if this GID has an associated network device
+            if (hasNetworkDevice(device_name, port, i)) {
+                // Found a GID with network device, this is the best choice
                 gid_index = i;
-                return GidNetworkState::GID_WITH_NETWORK;
+                state = GidNetworkState::GID_WITH_NETWORK;
+                break;
             }
-            if (fallback_ipv4_gid_without_network < 0) {
+            // No network device, keep the first one as fallback candidate
+            if (!fallback_found) {
                 gid_index = i;
-                fallback_ipv4_gid_without_network = i;
+                fallback_found = true;
                 state = GidNetworkState::GID_WITHOUT_NETWORK;
             }
-            continue;
-        }
-
-        if (has_network_device && fallback_ipv6_gid_with_network < 0) {
-            fallback_ipv6_gid_with_network = i;
-        }
-
-        if (!has_network_device && fallback_ipv6_gid_without_network < 0) {
-            fallback_ipv6_gid_without_network = i;
         }
     }
-
-    if (fallback_ipv4_gid_without_network >= 0) {
-        gid_index = fallback_ipv4_gid_without_network;
-        return GidNetworkState::GID_WITHOUT_NETWORK;
-    }
-
-    if (fallback_ipv6_gid_with_network >= 0) {
-        gid_index = fallback_ipv6_gid_with_network;
-        return GidNetworkState::GID_WITH_NETWORK;
-    }
-
-    if (fallback_ipv6_gid_without_network >= 0) {
-        gid_index = fallback_ipv6_gid_without_network;
-        return GidNetworkState::GID_WITHOUT_NETWORK;
-    }
-
     return state;
 }
 
@@ -614,16 +589,16 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             }
         } else {
             // Also check network state for user-specified GID
-            bool has_ndev = hasNetworkDevice(device_name, port, gid_index);
-            if (!has_ndev) {
+            if (!hasNetworkDevice(device_name, port, gid_index)) {
                 LOG(WARNING) << "User-specified GID index " << gid_index
                              << " on " << device_name << "/" << port
                              << " has no associated network device, "
                              << "may not be optimal for RDMA operations";
+                goto cleanup_context_and_devices;
             }
             LOG(INFO) << "Using user-specified GID index: " << gid_index
-                      << " on " << device_name << "/" << port << " ("
-                      << (has_ndev ? "with" : "without") << " network device)";
+                      << " on " << device_name << "/" << port
+                      << " (with network device)";
         }
 
         // Continue with GID validation

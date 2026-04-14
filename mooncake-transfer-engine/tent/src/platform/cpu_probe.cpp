@@ -35,9 +35,37 @@
 #include <sys/stat.h>
 #include <unordered_set>
 #include <unistd.h>
+#ifdef USE_SUNRISE
+#include <tang_runtime_api.h>
+#endif
 
 namespace mooncake {
 namespace tent {
+#ifdef USE_SUNRISE
+static tangError_t queryTangAttrsBestEffort(void* ptr,
+                                            tangPointerAttributes* attr) {
+    if (!ptr || !attr) return tangErrorInvalidValue;
+    tangError_t ret = tangPointerGetAttributes(attr, ptr);
+    if (ret == tangSuccess) return ret;
+
+    int saved_dev = -1;
+    tangGetDevice(&saved_dev);
+    int dev_count = 0;
+    if (tangGetDeviceCount(&dev_count) != tangSuccess || dev_count <= 0) {
+        return ret;
+    }
+    for (int d = 0; d < dev_count; ++d) {
+        tangSetDevice(d);
+        ret = tangPointerGetAttributes(attr, ptr);
+        if (ret == tangSuccess) {
+            if (saved_dev >= 0) tangSetDevice(saved_dev);
+            return ret;
+        }
+    }
+    if (saved_dev >= 0) tangSetDevice(saved_dev);
+    return ret;
+}
+#endif
 static bool isIbDeviceAccessible(struct ibv_device* device) {
     char device_path[PATH_MAX];
     struct stat st;
@@ -269,6 +297,18 @@ Status CpuPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
     return Status::OK();
 }
 
+MemoryType CpuPlatform::getMemoryType(void* addr) {
+#ifdef USE_SUNRISE
+    tangPointerAttributes attributes{};
+    tangError_t ret = queryTangAttrsBestEffort(addr, &attributes);
+    if (ret == tangSuccess && attributes.type == tangMemoryTypeDevice) {
+        return MTYPE_CUDA;
+    }
+#endif
+    (void)addr;
+    return MTYPE_CPU;
+}
+
 static inline uintptr_t alignPage(uintptr_t address) {
     const static size_t kPageSize = 4096;
     return address & ~(kPageSize - 1);
@@ -284,6 +324,15 @@ const std::vector<RangeLocation> CpuPlatform::getLocation(void* start,
                                                           bool skip_prefault) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
+
+#ifdef USE_SUNRISE
+    tangPointerAttributes attributes{};
+    tangError_t ret = queryTangAttrsBestEffort(start, &attributes);
+    if (ret == tangSuccess && attributes.type == tangMemoryTypeDevice) {
+        return {{(uint64_t)start, len,
+                 "cuda:" + std::to_string(attributes.device)}};
+    }
+#endif
 
     // start and end address may not be page aligned.
     uintptr_t aligned_start = alignPage((uintptr_t)start);

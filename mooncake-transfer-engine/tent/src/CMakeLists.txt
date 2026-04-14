@@ -59,6 +59,11 @@ else()
     message(STATUS "Uring: Disabled")
 endif()
 
+if (USE_SUNRISE)
+    target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
+    target_include_directories(tent_interface INTERFACE /usr/local/tangrt/include)
+endif()
+
 set(YALANTING_TARGET yalantinglibs::yalantinglibs)
 if (NOT TARGET ${YALANTING_TARGET})
     if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

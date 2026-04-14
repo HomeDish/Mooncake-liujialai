@@ -36,7 +36,7 @@ class CpuPlatform : public Platform {
 
     virtual Status copy(void *dst, void *src, size_t length);
 
-    virtual MemoryType getMemoryType(void *addr) { return MTYPE_CPU; }
+    virtual MemoryType getMemoryType(void *addr);
 
     virtual const std::vector<RangeLocation> getLocation(
         void *start, size_t len, bool skip_prefault = false);

@@ -11,89 +11,63 @@ if(USE_HIP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
-if(BUILD_SHARED_LIBS)
+if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
 
 add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD CMAKE_INCLUDE)
-if(USE_ETCD)
-  if(USE_ETCD_LEGACY)
-    if(USE_STATIC_ETCD_CPP_API)
+if (USE_ETCD)
+  if (USE_ETCD_LEGACY)
+    if (USE_STATIC_ETCD_CPP_API)
       find_package(PkgConfig REQUIRED)
       pkg_check_modules(GRPCPP REQUIRED grpc++)
       pkg_check_modules(GRPC REQUIRED grpc)
-      target_link_libraries(
-        transfer_engine PUBLIC etcd-cpp-api-core protobuf ${GRPC_LDFLAGS}
-                               ${GRPCPP_LDFLAGS})
+      target_link_libraries(transfer_engine PUBLIC etcd-cpp-api-core protobuf ${GRPC_LDFLAGS} ${GRPCPP_LDFLAGS})
     else()
       target_link_libraries(transfer_engine PUBLIC etcd-cpp-api)
     endif()
-  else()
+  else ()
     add_dependencies(transfer_engine build_etcd_wrapper)
-    set(ETCD_WRAPPER_LIB
-        ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so
-    )
+    set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so)
     target_link_libraries(transfer_engine PRIVATE ${ETCD_WRAPPER_LIB})
   endif()
 endif()
-if(USE_REDIS)
+if (USE_REDIS)
   target_link_libraries(transfer_engine PUBLIC hiredis)
 endif()
-if(USE_HTTP)
+if (USE_HTTP)
   find_package(CURL REQUIRED)
+  if (CURL_LIBRARIES AND (NOT EXISTS "${CURL_LIBRARIES}"))
+    set(CURL_LIBRARIES curl)
+  endif()
   target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
 endif()
 target_link_libraries(
-  transfer_engine
-  PUBLIC base
-         transport
-         rdma_transport
-         ibverbs
-         glog::glog
-         gflags::gflags
-         pthread
-         JsonCpp::JsonCpp
-         numa
-         asio_shared
-         yalantinglibs::yalantinglibs)
+    transfer_engine
+    PUBLIC
+    base transport rdma_transport ibverbs glog::glog gflags::gflags pthread jsoncpp numa yalantinglibs::yalantinglibs
+    )
 
-if(USE_BAREX)
+if (USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)
 endif()
 
-if(USE_CUDA)
+if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
   target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
-  if(USE_NVMEOF)
+  if (USE_NVMEOF)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
   endif()
 endif()
 
-if(USE_MACA)
-  if(DEFINED ENV{MACA_HOME})
-    set(MACA_HOME $ENV{MACA_HOME})
-  else()
-    set(MACA_HOME /opt/maca)
-  endif()
-  if(NOT DEFINED MACA_RUNTIME_LIBS)
-    set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)
-  endif()
-  target_include_directories(transfer_engine PRIVATE ${MACA_HOME}/include)
-  target_link_libraries(transfer_engine PUBLIC ${MACA_RUNTIME_LIBS})
-endif()
-
-if(USE_MUSA)
+if (USE_MUSA)
   target_include_directories(transfer_engine PRIVATE /usr/local/musa/include)
   target_link_libraries(transfer_engine PUBLIC musa musart rt)
 endif()
 
-if(USE_HIP)
+if (USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
-endif()
-
-if(USE_MLU)
-  target_link_libraries(transfer_engine PUBLIC cnrt cndrv)
 endif()
 
 if (USE_ASCEND)
@@ -104,10 +78,6 @@ if (USE_ASCEND_DIRECT)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
-if (USE_UBSHMEM)
-  target_link_libraries(transfer_engine PUBLIC ascend_transport)
-endif()
-
 if (USE_ASCEND_HETEROGENEOUS)
   file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
@@ -115,21 +85,19 @@ if (USE_ASCEND_HETEROGENEOUS)
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
 endif()
 
-if(USE_TENT)
+if (USE_TENT)
   add_compile_definitions(transfer_engine PUBLIC USE_TENT)
   target_link_libraries(transfer_engine PUBLIC tent)
 endif()
 
-if(USE_INTRA_NVLINK)
-  message(STATUS "Enabled USE_INTRA_NVLINK support")
-  target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
-endif()
-
-if(USE_EFA)
-  message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
-  target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
-endif()
-if(USE_UB)
-  message(STATUS "Enabled USE_UB protocol support")
-  target_link_libraries(transfer_engine PUBLIC ub_transport)
+if (USE_SUNRISE)
+  target_link_libraries(transfer_engine PUBLIC
+          -Wl,--whole-archive
+          #                        "/usr/local/pccl/lib/linux-x86_64/libpccl.a"
+#          "/data/liujialai/codes/pccl_mapping/cmake-build-debug-remote-host6035/libpccl.a"
+#          "/data/liujialai/codes/practice/cmake-build-debug-remote-host6035/libpcclNetTestGdr.a"
+          "/usr/local/tangrt/lib/linux-x86_64/libtangrt_static.a"
+          "/data/liujialai/codes/practice/cmake-build-debug-remote-host6035/pccl_connection/libpccl_connection.so"
+          -Wl,--no-whole-archive
+        )
 endif()

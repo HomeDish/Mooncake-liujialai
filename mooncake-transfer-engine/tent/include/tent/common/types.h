@@ -44,6 +44,9 @@ struct Request {
     SegmentID target_id;
     uint64_t target_offset;
     size_t length;
+    // SunriseLink specific fields
+    int remote_gpu_id = -1;
+    int remote_port = -1;
 };
 
 enum TransferStatusEnum {
@@ -79,9 +82,10 @@ enum TransportType {
     IOURING,
     TCP,
     AscendDirect,
+    SUNRISE_LINK,
     UNSPEC
 };
-const static int kSupportedTransportTypes = 8;
+const static int kSupportedTransportTypes = 10;
 
 struct MemoryOptions {
     Location location = kWildcardLocation;

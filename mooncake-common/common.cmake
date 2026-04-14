@@ -40,9 +40,6 @@ add_definitions(-DCONFIG_ERDMA)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Memory-aware build parallelism (compile vs. link job pools)
-include(${CMAKE_CURRENT_LIST_DIR}/limit_jobs.cmake)
-
 option(ENABLE_SCCACHE "Whether to open sccache" OFF)
 if (ENABLE_SCCACHE)
   find_program(SCCACHE sccache REQUIRED)
@@ -60,47 +57,16 @@ option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
-option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
-option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
 option(USE_ASCEND "option for using npu with HCCL" OFF)
 option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
-option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
 option(USE_ASCEND_HETEROGENEOUS "option for transferring between ascend npu and gpu" OFF)
 option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
-option(USE_EFA "option for using AWS EFA transport" OFF)
-option(USE_UB "option for using UB protocol transport" OFF)
-
-if (USE_UB)
-  add_compile_definitions(USE_UB)
-  message(STATUS "ub transport is enabled")
-endif()
-if (USE_EFA)
-  # Find libfabric headers and library; default to AWS EFA installer path
-  find_path(LIBFABRIC_INCLUDE_DIR rdma/fabric.h
-    HINTS /opt/amazon/efa/include
-    PATH_SUFFIXES include)
-  find_library(LIBFABRIC_LIBRARY fabric
-    HINTS /opt/amazon/efa/lib
-    PATH_SUFFIXES lib lib64)
-
-  if (NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
-    message(FATAL_ERROR "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY.")
-  endif()
-
-  get_filename_component(LIBFABRIC_LIB_DIR ${LIBFABRIC_LIBRARY} DIRECTORY)
-  include_directories(${LIBFABRIC_INCLUDE_DIR})
-  link_directories(${LIBFABRIC_LIB_DIR})
-  add_compile_definitions(USE_EFA)
-  message(STATUS "AWS EFA (libfabric) transport is enabled")
-  message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
-  message(STATUS "  libfabric library: ${LIBFABRIC_LIBRARY}")
-endif()
 option(USE_ETCD "option for enable etcd as metadata server" OFF)
 option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
@@ -112,14 +78,15 @@ option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If W
 option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_TENT "option for building Mooncake TENT" OFF)
-option(ENABLE_MULTI_PROTOCOL "option for enabling multi-protocol support in transfer engine" OFF)
-if (ENABLE_MULTI_PROTOCOL)
-    add_compile_definitions(ENABLE_MULTI_PROTOCOL)
-    message(STATUS "Multi-protocol support is enabled")
-endif()
+option(USE_SUNRISE "option using sunrise lib" ON)
+
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
-option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
 set(LRU_MAX_CAPACITY 1000)
+
+if (USE_SUNRISE)
+  add_compile_definitions(USE_SUNRISE)
+  message(STATUS "sunrise libs are used")
+endif()
 
 if (USE_LRU_MASTER)
   add_compile_definitions(USE_LRU_MASTER)
@@ -140,7 +107,7 @@ if (USE_NVMEOF)
 endif()
 
 if (USE_MNNVL)
-  if (NOT USE_HIP AND NOT USE_MUSA AND NOT USE_MACA)
+  if (NOT USE_HIP AND NOT USE_MUSA)
     set(USE_CUDA ON)
   endif()
   add_compile_definitions(USE_MNNVL)
@@ -154,48 +121,6 @@ if (USE_CUDA)
   link_directories(
     /usr/local/cuda/lib
     /usr/local/cuda/lib64
-  )
-endif()
-
-if (NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
-  if (DEFINED ENV{NEUWARE_HOME} AND NOT "$ENV{NEUWARE_HOME}" STREQUAL "")
-    set(NEUWARE_ROOT "$ENV{NEUWARE_HOME}" CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
-  else()
-    set(NEUWARE_ROOT "/usr/local/neuware" CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
-  endif()
-endif()
-
-if (NOT DEFINED MLU_INCLUDE_DIR OR MLU_INCLUDE_DIR STREQUAL "")
-  set(MLU_INCLUDE_DIR "${NEUWARE_ROOT}/include")
-endif()
-
-if (NOT DEFINED MLU_LIB_DIR OR MLU_LIB_DIR STREQUAL "")
-  set(MLU_LIB_DIR "${NEUWARE_ROOT}/lib64")
-endif()
-
-if (USE_MLU)
-  add_compile_definitions(USE_MLU)
-  message(STATUS "MLU support is enabled")
-  include_directories(${MLU_INCLUDE_DIR})
-  if (EXISTS "${MLU_LIB_DIR}")
-    link_directories(${MLU_LIB_DIR})
-  endif()
-endif()
-
-if (USE_MACA)
-  # MACA toolchain is CUDA-compatible in first-stage porting.
-  # Reuse CUDA code paths to get a runnable baseline quickly.
-  add_compile_definitions(USE_MACA)
-  message(STATUS "MACA support is enabled")
-  if(DEFINED ENV{MACA_HOME})
-    set(MACA_HOME $ENV{MACA_HOME})
-  else()
-    set(MACA_HOME /opt/maca)
-  endif()
-  include_directories(${MACA_HOME}/include)
-  link_directories(
-    ${MACA_HOME}/lib
-    ${MACA_HOME}/lib64
   )
 endif()
 
@@ -262,7 +187,7 @@ if (USE_BAREX)
   add_compile_definitions(USE_BAREX)
 endif()
 
-if (USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
+if (USE_ASCEND OR USE_ASCEND_DIRECT)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)
@@ -296,11 +221,6 @@ endif()
 if (USE_ASCEND_DIRECT)
   set(BUILD_SHARED_LIBS ON)
   add_compile_definitions(USE_ASCEND_DIRECT)
-endif()
-
-if (USE_UBSHMEM)
-  set(BUILD_SHARED_LIBS ON)
-  add_compile_definitions(USE_UBSHMEM)
 endif()
 
 if (USE_ASCEND_HETEROGENEOUS)

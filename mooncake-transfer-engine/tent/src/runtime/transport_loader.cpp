@@ -37,6 +37,10 @@
 #include "tent/transport/ascend/ascend_direct_transport.h"
 #endif
 
+#ifdef USE_SUNRISE
+#include "tent/transport/sunrise_link/sunrise_link_transport.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -49,14 +53,14 @@ Status TransferEngineImpl::loadTransports() {
         transport_list_[SHM] = std::make_shared<ShmTransport>();
 
 #ifdef USE_RDMA
-    if (conf_->get("transports/rdma/enable", true) &&
+    if (conf_->get("transports/rdma/enable", false) &&
         topology_->getNicCount(Topology::NIC_RDMA)) {
         transport_list_[RDMA] = std::make_shared<RdmaTransport>();
     }
 #endif
 
 #ifdef USE_URING
-    if (conf_->get("transports/io_uring/enable", true))
+    if (conf_->get("transports/io_uring/enable", false))
         transport_list_[IOURING] = std::make_shared<IOUringTransport>();
 #endif
 
@@ -80,6 +84,12 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/ascend_direct/enable", true)) {
         transport_list_[AscendDirect] =
             std::make_shared<AscendDirectTransport>();
+    }
+#endif
+
+#ifdef USE_SUNRISE
+    if (conf_->get("transports/sunrise_link/enable", true)) {
+        transport_list_[SUNRISE_LINK] = std::make_shared<SunriseLinkTransport>();
     }
 #endif
 
