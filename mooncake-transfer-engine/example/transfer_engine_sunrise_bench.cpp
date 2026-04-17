@@ -17,12 +17,15 @@
 #include <signal.h>
 #include <sys/time.h>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 
 #include "common.h"
@@ -41,37 +44,25 @@
 #include <cufile.h>
 #endif
 #endif
+#ifdef USE_SUNRISE
+#include <tang_runtime_api.h>
+#endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_UBSHMEM) || defined(USE_SUNRISE)
+    defined(USE_SUNRISE)
 #include <cassert>
 
-#if defined(USE_MNNVL) || defined(USE_UBSHMEM)
+#ifdef USE_MNNVL
 #include "gpu_vendor/mnnvl.h"
 #endif
 
-#ifdef USE_INTRA_NVLINK
-#include "gpu_vendor/intra_nvlink.h"
-#endif
-
-#if defined(USE_UBSHMEM)
-static void checkAclError(aclError result, const char *message) {
-    if (result != ACL_ERROR_NONE) {
-        const char *errMsg = aclGetRecentErrMsg();
-        LOG(ERROR) << message << " (Error code: " << result << " - " << errMsg
-                   << ")";
-        exit(EXIT_FAILURE);
-    }
-}
-#else
-static void checkCudaError(cudaError_t result, const char *message) {
-    if (result != cudaSuccess) {
+static void checkTangError(tangError_t result, const char *message) {
+    if (result != tangSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
-                   << cudaGetErrorString(result) << ")" << std::endl;
+                   << tangGetErrorString(result) << ")" << std::endl;
         exit(EXIT_FAILURE);
     }
 }
-#endif
 #endif
 
 const static int NR_SOCKETS =
@@ -81,15 +72,15 @@ static int buffer_num = NR_SOCKETS;
 
 DEFINE_string(local_server_name, mooncake::getHostname(),
               "Local server name for segment discovery");
-DEFINE_string(metadata_server, "192.168.3.77:2379", "etcd server host address");
+DEFINE_string(
+    metadata_server, P2PHANDSHAKE,
+    "Metadata: P2PHANDSHAKE, etcd://host:port, redis://..., or host:port");
 DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma",
-              "Transfer protocol: "
-              "rdma|barex|tcp|efa|nvlink|nvlink_intra|hip|sunrise_link");
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|barex|tcp|nvlink|hip");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -97,30 +88,42 @@ DEFINE_string(nic_priority_matrix, "",
               "Path to RDMA NIC priority matrix file (Advanced)");
 
 DEFINE_string(segment_id, "192.168.3.76", "Segment ID to access data");
-DEFINE_uint64(buffer_size, 1ull << 30, "total size of data buffer");
+DEFINE_uint64(buffer_size, 1ull << 20,
+              "total size of data buffer");  // 4GB for 4MB block_size test
 DEFINE_int32(batch_size, 128, "Batch size");
 DEFINE_uint64(block_size, 65536, "Block size for each transfer request");
 DEFINE_int32(duration, 10, "Test duration in seconds");
+DEFINE_int32(transfer_wait_timeout_sec, 0,
+             "Per-batch ceiling on waiting for completion (0 = no limit). "
+             "Use when transfers can hang (e.g. driver stuck PENDING).");
 DEFINE_int32(threads, 12, "Task submission threads");
 DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
-DEFINE_string(backend, "classic", "Backend to use: classic|tent");
+DEFINE_string(backend, "tent",
+              "Backend to use: classic|tent (this binary defaults to tent for "
+              "SunriseLink)");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_UBSHMEM) || defined(USE_SUNRISE)
-DEFINE_bool(use_vram, true, "Allocate memory from GPU/NPU VRAM");
+    defined(USE_SUNRISE)
+DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
-DEFINE_int32(gpu_id, 0,
-             "GPU/NPU ID to use, -1 for all GPUs, not supported for NPUs");
+DEFINE_int32(gpu_id, 0, "GPU ID to use, -1 for all GPUs");
+DEFINE_bool(copy_dram, false,
+            "if use transfer path: vram1->dram1->rdma1->rdma2->dram2->vram2");
+#ifdef USE_SUNRISE
+DEFINE_bool(
+    sunrise_use_mapped_host_vram, true,
+    "Use tangHostAlloc(mapped host memory) instead of tangMalloc for VRAM");
+#endif
 #endif
 
 using namespace mooncake;
 
 static void *allocateMemoryPool(size_t size, int buffer_id,
-                                bool from_vram = false) {
+                                bool from_vram = true) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_UBSHMEM) || defined(USE_SUNRISE)
+    defined(USE_SUNRISE)
     if (from_vram) {
         int gpu_id;
         if (FLAGS_gpu_id == -1) {
@@ -129,61 +132,31 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
             gpu_id = FLAGS_gpu_id;
         }
         void *d_buf;
-#if defined(USE_UBSHMEM)
-        LOG(INFO) << "Allocating memory on NPU " << gpu_id;
-        checkAclError(aclrtSetDevice(gpu_id), "Failed to set device");
-#else
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
-        checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-#endif
-        if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
+        // checkTangError(tangSetDevice(gpu_id), "Failed to set device");
 #ifdef USE_MNNVL
-            d_buf = allocateFabricMemory(size);
-            LOG(INFO) << "Using MNNVL fabric memory allocation";
+        d_buf = allocateFabricMemory(size);
 #else
-            LOG(ERROR)
-                << "--protocol=nvlink or --protocol=hip requires USE_MNNVL=ON";
-            return nullptr;
-#endif
-        } else if (FLAGS_protocol == "nvlink_intra") {
-#ifdef USE_INTRA_NVLINK
-            d_buf = allocateFabricMemory_intra(size);
-            LOG(INFO) << "Using intra-NVLink memory allocation";
-#else
-            LOG(ERROR)
-                << "--protocol=nvlink_intra requires USE_INTRA_NVLINK=ON";
-            return nullptr;
-#endif
-        } else if (FLAGS_protocol == "ubshmem") {
-#ifdef USE_UBSHMEM
-            d_buf = allocateFabricMemory(size);
-            LOG(INFO) << "Using UBShmem fabric memory allocation";
-#else
-            LOG(ERROR) << "--protocol=ubshmem requires USE_UBSHMEM=ON";
-            return nullptr;
-#endif
+        if (FLAGS_sunrise_use_mapped_host_vram) {
+            checkTangError(
+                tangHostAlloc(&d_buf, size, tangHostAllocMapDeviceMemory),
+                "Failed to allocate mapped host memory");
         } else {
-#ifndef USE_UBSHMEM
-            checkCudaError(cudaMalloc(&d_buf, size),
-                           "Failed to allocate device memory");
+            checkTangError(tangSetDevice(gpu_id), "Failed to set device");
+            checkTangError(tangMalloc(&d_buf, size),
+                           "Failed to allocate device VRAM");
+        }
 #endif
-        }
-#if defined(USE_UBSHMEM)
+        LOG(INFO) << "Allocated memory on GPU " << gpu_id << ", addr=" << d_buf
+                  << ", size=" << (size >> 20) << "MB";
         if (FLAGS_init_mem) {
-            checkAclError(aclrtMemset(d_buf, size, 0xCC, size),
-                          "Failed to initialize device memory");
-        }
-        return d_buf;
-#else
-        if (FLAGS_init_mem) {
-            checkCudaError(cudaMemset(d_buf, 0xCC, size),
-                           "Failed to initialize device memory");
+            // memset(d_buf, 0, size);
             // Ensure memory initialization is done from CPU standpoint
-            checkCudaError(cudaStreamSynchronize(0), "Failed to synchronize");
+            // checkCudaError(cudaStreamSynchronize(0), "Failed to
+            // synchronize");
         }
 
         return d_buf;
-#endif
     }
 #endif
     return numa_alloc_onnode(size, buffer_id);
@@ -191,54 +164,18 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_UBSHMEM) || defined(USE_SUNRISE)
-    if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
-#ifdef USE_MNNVL
-        if (FLAGS_use_vram) {
-            freeFabricMemory(addr);
-            return;
-        }
-#endif  // USE_MNNVL
-    } else if (FLAGS_protocol == "nvlink_intra") {
-#ifdef USE_INTRA_NVLINK
-        if (FLAGS_use_vram) {
-            freeFabricMemory_intra(addr);
-            return;
-        }
-#endif
-    } else if (FLAGS_protocol == "ubshmem") {
-#ifdef USE_UBSHMEM
-        if (FLAGS_use_vram) {
-            freeFabricMemory(addr);
-            return;
-        }
-#endif
-    } else {
-#ifndef USE_UBSHMEM
-        if (!FLAGS_use_vram) {
-            numa_free(addr, size);
-            return;
-        }
-        // check pointer on GPU
-        cudaPointerAttributes attributes;
-        checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                       "Failed to get pointer attributes");
-
-        if (attributes.type == cudaMemoryTypeDevice) {
-            cudaFree(addr);
-        } else if (attributes.type == cudaMemoryTypeHost ||
-                   attributes.type == cudaMemoryTypeUnregistered) {
-            numa_free(addr, size);
+    defined(USE_SUNRISE)
+    if (FLAGS_use_vram) {
+        if (FLAGS_sunrise_use_mapped_host_vram) {
+            tangFreeHost(addr);
         } else {
-            LOG(ERROR) << "Unknown memory type, " << addr << " "
-                       << attributes.type;
+            tangFree(addr);
         }
-#endif
+        return;
+    } else {
+        numa_free(addr, size);
     }
 #else
-    if (FLAGS_protocol == "ub") {
-        munmap(addr, size);  // for urma
-    }
     numa_free(addr, size);
 #endif
 }
@@ -273,28 +210,17 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
     return oss.str();
 }
 
-volatile bool running = true;
+std::atomic<bool> running{true};
 std::atomic<size_t> total_batch_count(0);
-
-// Ensure each worker thread has a valid GPU context before issuing transfers.
-static inline void setWorkerDeviceIfNeeded() {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_SUNRISE)
-    if (FLAGS_use_vram && FLAGS_gpu_id >= 0) {
-        checkCudaError(cudaSetDevice(FLAGS_gpu_id),
-                       "Failed to set device in worker");
-    }
-#endif
-}
 
 // Common helper to determine buffer count based on GPU/NUMA configuration
 static int determineBufferCount() {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_SUNRISE)
+    defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
-        if (FLAGS_gpu_id == -1 && cudaGetDeviceCount(&gpu_num) == cudaSuccess) {
+        if (FLAGS_gpu_id == -1 && tangGetDeviceCount(&gpu_num) == tangSuccess) {
             LOG(INFO) << "GPU ID is not specified, found " << gpu_num
                       << " GPUs to use";
             return gpu_num;
@@ -303,13 +229,6 @@ static int determineBufferCount() {
                       << FLAGS_gpu_id << " GPU";
             return 1;
         }
-    }
-#endif
-#if defined(USE_UBSHMEM)
-    if (FLAGS_use_vram) {
-        LOG(INFO) << "VRAM is used";
-        LOG(INFO) << "NPU ID is specified, use NPU:" << FLAGS_gpu_id;
-        return 1;
     }
 #endif
     LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
@@ -321,7 +240,7 @@ static std::vector<void *> allocateBuffers() {
     buffer_num = determineBufferCount();
     std::vector<void *> addr(buffer_num);
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_UBSHMEM) || defined(USE_SUNRISE)
+    defined(USE_SUNRISE)
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
     }
@@ -344,7 +263,7 @@ static void freeBuffers(std::vector<void *> &addr) {
 // Helper to get location name for classic backend
 static std::string getLocationName(int buffer_id) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_UBSHMEM) || defined(USE_SUNRISE)
+    defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
         int name_suffix = (FLAGS_gpu_id == -1) ? buffer_id : FLAGS_gpu_id;
         return std::string(GPU_PREFIX) + std::to_string(name_suffix);
@@ -375,7 +294,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         (uint64_t)segment_desc->buffers[thread_id % buffer_num].addr;
 
     size_t batch_count = 0;
-    while (running) {
+    while (running.load(std::memory_order_acquire)) {
         auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
         Status s;
         std::vector<TransferRequest> requests;
@@ -383,22 +302,48 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
             TransferRequest entry;
             entry.opcode = opcode;
             entry.length = FLAGS_block_size;
-            entry.source = (uint8_t *)(addr) +
-                           FLAGS_block_size * (i * FLAGS_threads + thread_id);
+            // Contiguous per-thread regions so TENT mergeRequests() can fuse a
+            // batch into one memcpy (interleaved i*threads+tid prevents
+            // merging).
+            entry.source =
+                (uint8_t *)(addr) +
+                FLAGS_block_size * (thread_id * FLAGS_batch_size + i);
             entry.target_id = segment_id;
             entry.target_offset =
                 remote_base +
-                FLAGS_block_size * (i * FLAGS_threads + thread_id);
+                FLAGS_block_size * (thread_id * FLAGS_batch_size + i);
             requests.emplace_back(entry);
         }
 
         s = engine->submitTransfer(batch_id, requests);
         if (!s.ok()) LOG(ERROR) << s.ToString();
         LOG_ASSERT(s.ok());
+        const auto batch_wait_start = std::chrono::steady_clock::now();
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
             bool completed = false;
             TransferStatus status;
             while (!completed) {
+                if (!running.load(std::memory_order_acquire)) {
+                    LOG(ERROR)
+                        << "Worker " << thread_id
+                        << ": test duration elapsed during transfer wait; "
+                           "freeing batch and exiting";
+                    (void)engine->freeBatchID(batch_id);
+                    return Status::OK();
+                }
+                if (FLAGS_transfer_wait_timeout_sec > 0) {
+                    auto elapsed =
+                        std::chrono::steady_clock::now() - batch_wait_start;
+                    if (elapsed >
+                        std::chrono::seconds(FLAGS_transfer_wait_timeout_sec)) {
+                        LOG(ERROR) << "Worker " << thread_id
+                                   << ": transfer wait exceeded "
+                                   << FLAGS_transfer_wait_timeout_sec
+                                   << "s (see -transfer_wait_timeout_sec)";
+                        (void)engine->freeBatchID(batch_id);
+                        exit(EXIT_FAILURE);
+                    }
+                }
                 Status s = engine->getTransferStatus(batch_id, task_id, status);
                 LOG_ASSERT(s.ok());
                 if (status.s == TransferStatusEnum::COMPLETED)
@@ -407,6 +352,8 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
                     LOG(INFO) << "FAILED";
                     completed = true;
                     exit(EXIT_FAILURE);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::microseconds(10));
                 }
             }
         }
@@ -459,9 +406,6 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"musa:0\": [[" +
-           device_names +
-           "], []], "
-           " \"maca:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -482,18 +426,8 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
         args.get()[0] = const_cast<char *>(nic_priority_matrix.c_str());
         args.get()[1] = nullptr;
         xport = engine->installTransport(FLAGS_protocol.c_str(), args.get());
-    } else if (FLAGS_protocol == "ub") {
-        engine->getLocalTopology()->discover({FLAGS_device_name});
-        xport = engine->installTransport(FLAGS_protocol, nullptr);
-    } else if (FLAGS_protocol == "efa") {
-        // EFA needs topology discovery to find devices, but auto_discovery
-        // would auto-install RDMA transport. Manually discover instead.
-        engine->getLocalTopology()->discover({});
-        xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
-               FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra" ||
-               FLAGS_protocol == "ubshmem" ||
-               FLAGS_protocol == "sunrise_link") {
+               FLAGS_protocol == "hip") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
@@ -503,6 +437,7 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
 }
 
 int initiator() {
+    running.store(true, std::memory_order_release);
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
 
@@ -534,7 +469,7 @@ int initiator() {
                                  addr[i % buffer_num]);
 
     sleep(FLAGS_duration);
-    running = false;
+    running.store(false, std::memory_order_release);
 
     for (int i = 0; i < FLAGS_threads; ++i) workers[i].join();
 
@@ -610,7 +545,15 @@ namespace tent_backend {
 static void registerBuffers(mooncake::tent::TransferEngine *engine,
                             std::vector<void *> &addr) {
     for (int i = 0; i < buffer_num; ++i) {
-        auto status = engine->registerLocalMemory(addr[i], FLAGS_buffer_size);
+        mooncake::tent::MemoryOptions options;
+        if (FLAGS_use_vram && FLAGS_sunrise_use_mapped_host_vram) {
+            options.location = "cpu:" + std::to_string(i);
+        } else {
+            options.location = getLocationName(i);
+        }
+        options.perm = mooncake::tent::kGlobalReadWrite;
+        auto status =
+            engine->registerLocalMemory(addr[i], FLAGS_buffer_size, options);
         LOG_ASSERT(status.ok())
             << "Failed to register memory: " << status.ToString();
     }
@@ -651,7 +594,44 @@ std::shared_ptr<mooncake::tent::Config> createTentConfig() {
     config->set("metadata_type", metadata_type);
     config->set("metadata_servers", metadata_servers);
     config->set("local_segment_name", FLAGS_local_server_name);
-    config->set("transports/rdma/enable", false);
+    // P2P mode builds segment name from rpc bind address, not from this field
+    // alone. Without rpc_server_hostname/port, TE discovers another NIC (e.g.
+    // 192.168.*) and the peer cannot connect using
+    // -segment_id=10.21.60.35:port.
+    {
+        auto hp = parseHostNameWithPort(FLAGS_local_server_name);
+        if (!hp.first.empty()) {
+            config->set("rpc_server_hostname", hp.first);
+        }
+        config->set("rpc_server_port", static_cast<int>(hp.second));
+    }
+    // Minimal diagnostics during initiator/target perf runs (not "verbose" TE
+    // logs).
+    config->set("verbose", false);
+    // Keep request granularity for Sunrise IPC path (ipcC2cTest-style).
+    // Merging can expand length across buffer boundaries and become UNSPEC.
+    config->set("merge_requests", false);
+
+    // Only SUNRISE_LINK: registerLocalMemory attaches buffers to this transport
+    // only, and routing cannot fall back to TCP/NVLink/RDMA.
+    config->set("transports/tcp/enable", false);
+    config->set("transports/shm/enable", false);
+    bool enable_rdma = FLAGS_sunrise_use_mapped_host_vram;
+    config->set("transports/rdma/enable", enable_rdma);
+    config->set("transports/io_uring/enable", false);
+    config->set("transports/nvlink/enable", false);
+    config->set("transports/mnnvl/enable", false);
+    config->set("transports/gds/enable", false);
+    config->set("transports/ascend_direct/enable", false);
+    // mapped_host_vram is intended for RDMA path with host pointers.
+    // Disable SunriseLink in this mode to avoid tang IPC handle path.
+    bool enable_sunrise_link =
+        !(FLAGS_use_vram && FLAGS_sunrise_use_mapped_host_vram);
+    config->set("transports/sunrise_link/enable", enable_sunrise_link);
+
+    LOG(INFO) << "TENT config: RDMA " << (enable_rdma ? "enabled" : "disabled")
+              << ", SUNRISE_LINK "
+              << (enable_sunrise_link ? "enabled" : "disabled");
 
     return config;
 }
@@ -661,7 +641,6 @@ void initiatorWorker(mooncake::tent::TransferEngine *engine,
                      void *addr,
                      const mooncake::tent::SegmentInfo &segment_info) {
     bindToSocket(thread_id % NR_SOCKETS);
-    setWorkerDeviceIfNeeded();
     mooncake::tent::Request::OpCode opcode;
     if (FLAGS_operation == "read")
         opcode = mooncake::tent::Request::READ;
@@ -681,39 +660,93 @@ void initiatorWorker(mooncake::tent::TransferEngine *engine,
         exit(EXIT_FAILURE);
     }
     uint64_t remote_base = segment_info.buffers[buffer_index].base;
+    int remote_gpu_id_hint = -1;
+    const auto &remote_loc = segment_info.buffers[buffer_index].location;
+    auto parse_remote_gpu = [](const std::string &loc) -> int {
+        auto pos = loc.find(':');
+        if (pos == std::string::npos) return -1;
+        auto type = loc.substr(0, pos);
+        if (type != "cuda" && type != "npu") return -1;
+        return std::atoi(loc.substr(pos + 1).c_str());
+    };
+    remote_gpu_id_hint = parse_remote_gpu(remote_loc);
 
     size_t batch_count = 0;
-    while (running) {
+    while (running.load(std::memory_order_acquire)) {
         auto batch_id = engine->allocateBatch(FLAGS_batch_size);
         std::vector<mooncake::tent::Request> requests;
         for (int i = 0; i < FLAGS_batch_size; ++i) {
             mooncake::tent::Request entry;
             entry.opcode = opcode;
             entry.length = FLAGS_block_size;
-            entry.source = (uint8_t *)(addr) +
-                           FLAGS_block_size * (i * FLAGS_threads + thread_id);
+            // Contiguous per-thread regions so TENT mergeRequests() can fuse a
+            // batch into one memcpy (interleaved i*threads+tid prevents
+            // merging).
+            entry.source =
+                (uint8_t *)(addr) +
+                FLAGS_block_size * (thread_id * FLAGS_batch_size + i);
             entry.target_id = segment_id;
             entry.target_offset =
                 remote_base +
-                FLAGS_block_size * (i * FLAGS_threads + thread_id);
+                FLAGS_block_size * (thread_id * FLAGS_batch_size + i);
+            entry.remote_gpu_id = remote_gpu_id_hint;
             requests.emplace_back(entry);
         }
 
         auto s = engine->submitTransfer(batch_id, requests);
         LOG_ASSERT(s.ok()) << "submitTransfer failed: " << s.ToString();
 
+        const auto batch_wait_start = std::chrono::steady_clock::now();
+        // Poll overall batch status (same aggregation as
+        // waitTransferCompletion).
         while (true) {
-            mooncake::tent::TransferStatus overall_status;
-            s = engine->getTransferStatus(batch_id, overall_status);
+            if (!running.load(std::memory_order_acquire)) {
+                LOG(ERROR)
+                    << "Worker " << thread_id
+                    << ": test duration elapsed during transfer wait; freeing "
+                       "batch and exiting";
+                auto fr = engine->freeBatch(batch_id);
+                if (!fr.ok()) {
+                    LOG(WARNING)
+                        << "freeBatch after shutdown: " << fr.ToString();
+                }
+                total_batch_count.fetch_add(batch_count);
+                return;
+            }
+            if (FLAGS_transfer_wait_timeout_sec > 0) {
+                auto elapsed =
+                    std::chrono::steady_clock::now() - batch_wait_start;
+                if (elapsed >
+                    std::chrono::seconds(FLAGS_transfer_wait_timeout_sec)) {
+                    LOG(ERROR)
+                        << "Worker " << thread_id << ": transfer wait exceeded "
+                        << FLAGS_transfer_wait_timeout_sec
+                        << "s (see -transfer_wait_timeout_sec)";
+                    (void)engine->freeBatch(batch_id);
+                    exit(EXIT_FAILURE);
+                }
+            }
+            mooncake::tent::TransferStatus overall;
+            s = engine->getTransferStatus(batch_id, overall);
             LOG_ASSERT(s.ok()) << "getTransferStatus failed: " << s.ToString();
-            if (overall_status.s ==
-                mooncake::tent::TransferStatusEnum::COMPLETED) {
+            // Integer completion check: this TU also includes classic
+            // transport headers; a second TransferStatusEnum can make
+            // `overall.s == TransferStatusEnum::COMPLETED` always false even
+            // when the underlying value is COMPLETED (see tent/common/types.h).
+            const int ost = static_cast<int>(overall.s);
+            const int kComp =
+                static_cast<int>(mooncake::tent::TransferStatusEnum::COMPLETED);
+            const int kFail =
+                static_cast<int>(mooncake::tent::TransferStatusEnum::FAILED);
+            if (ost == kComp) {
                 break;
-            } else if (overall_status.s ==
-                       mooncake::tent::TransferStatusEnum::FAILED) {
+            }
+            if (ost == kFail) {
                 LOG(ERROR) << "Transfer failed";
                 exit(EXIT_FAILURE);
             }
+            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
 
         s = engine->freeBatch(batch_id);
@@ -725,6 +758,7 @@ void initiatorWorker(mooncake::tent::TransferEngine *engine,
 }
 
 int initiator() {
+    running.store(true, std::memory_order_release);
     auto config = createTentConfig();
     auto engine = std::make_unique<mooncake::tent::TransferEngine>(config);
 
@@ -746,9 +780,29 @@ int initiator() {
     }
 
     mooncake::tent::SegmentInfo segment_info;
-    status = engine->getSegmentInfo(segment_id, segment_info);
-    if (!status.ok()) {
-        LOG(ERROR) << "Failed to get segment info: " << status.ToString();
+    // P2P mode can observe a short propagation delay between target startup and
+    // remote buffer metadata visibility. Re-open and retry a few times to avoid
+    // the first batch getting stuck in PENDING with stale remote descriptors.
+    bool ready = false;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        status = engine->getSegmentInfo(segment_id, segment_info);
+        if (status.ok() && !segment_info.buffers.empty()) {
+            ready = true;
+            break;
+        }
+        if (attempt > 0) {
+            (void)engine->closeSegment(segment_id);
+            auto reopen = engine->openSegment(segment_id, FLAGS_segment_id);
+            if (!reopen.ok()) {
+                LOG(WARNING)
+                    << "Re-open remote segment failed: " << reopen.ToString();
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!ready) {
+        LOG(ERROR) << "Failed to get remote segment info after retries: "
+                   << status.ToString();
         unregisterBuffers(engine.get(), addr);
         freeBuffers(addr);
         return EXIT_FAILURE;
@@ -764,7 +818,7 @@ int initiator() {
                                  addr[i % buffer_num], std::ref(segment_info));
 
     sleep(FLAGS_duration);
-    running = false;
+    running.store(false, std::memory_order_release);
 
     for (int i = 0; i < FLAGS_threads; ++i) workers[i].join();
 
@@ -828,17 +882,6 @@ int main(int argc, char **argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     check_total_buffer_size();
 
-#if defined(USE_UBSHMEM)
-    if (FLAGS_gpu_id != -1) {
-        checkAclError(aclrtSetDevice(FLAGS_gpu_id), "Failed to set device");
-        LOG(INFO) << "Set device to " << FLAGS_gpu_id;
-    } else {
-        LOG(ERROR) << "-1 is not supported for NPUs";
-    }
-    if (FLAGS_use_vram == false) {
-        LOG(ERROR) << "UBShmem transport only supports vram.";
-    }
-#endif
     if (FLAGS_backend == "classic") {
         if (FLAGS_mode == "initiator")
             return initiator();
